@@ -1,7 +1,7 @@
 import os
 import logging
 import hashlib
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Iterable
 from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
@@ -11,18 +11,46 @@ EXT_TEXT = {'.txt', '.md', '.markdown'}
 EXT_CODE = {'.py', '.js', '.java', '.ts', '.cpp', '.c', '.h', '.html', '.css', '.json', '.yaml', '.yml', '.sh'}
 LINES_PER_SEGMENT = 50
 
+def load_inputs(paths: Iterable[str]) -> List[Dict[str, Any]]:
+    """Ingest a mix of files and folders and extract text with metadata."""
+    documents: List[Dict[str, Any]] = []
+    normalized_paths = [p for p in (paths or []) if p and str(p).strip()]
+
+    if not normalized_paths:
+        logger.error("No input paths provided.")
+        return []
+
+    for raw_path in normalized_paths:
+        path = os.path.abspath(raw_path)
+        if not os.path.exists(path):
+            logger.warning(f"Skipping missing path: {raw_path}")
+            continue
+
+        if os.path.isdir(path):
+            documents.extend(_load_folder(path))
+        else:
+            documents.extend(_load_file(path, base_path=os.path.dirname(path)))
+
+    logger.info(f"Loaded {len(documents)} document segments from {len(normalized_paths)} inputs")
+    return documents
+
+
 def load_files(folder_path: str) -> List[Dict[str, Any]]:
-    """Scan folder recursively and extract text with metadata."""
-    documents = []
-    
+    """Backward-compatible folder ingestion."""
+    return _load_folder(folder_path)
+
+
+def _load_folder(folder_path: str) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+
     if not folder_path or not folder_path.strip():
         logger.error("Empty folder path provided.")
         return []
-    
+
     if not os.path.exists(folder_path):
         logger.error(f"Path does not exist: {folder_path}")
         return []
-    
+
     if not os.path.isdir(folder_path):
         logger.error(f"Path is not a directory: {folder_path}")
         return []
@@ -31,31 +59,37 @@ def load_files(folder_path: str) -> List[Dict[str, Any]]:
 
     for root, dirs, files in os.walk(folder_path):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
-        
+
         for file in files:
             if file.startswith('.'):
                 continue
-                
-            file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, folder_path)
-            
-            _, ext = os.path.splitext(file)
-            ext = ext.lower()
 
-            try:
-                if ext in EXT_PDF:
-                    docs = _process_pdf(file_path, rel_path)
-                    documents.extend(docs)
-                elif ext in EXT_TEXT:
-                    docs = _process_text_or_code(file_path, rel_path, "text")
-                    documents.extend(docs)
-                elif ext in EXT_CODE:
-                    docs = _process_text_or_code(file_path, rel_path, "code")
-                    documents.extend(docs)
-            except Exception as e:
-                logger.error(f"Failed to process {rel_path}: {str(e)}")
+            file_path = os.path.join(root, file)
+            documents.extend(_load_file(file_path, base_path=folder_path))
 
     logger.info(f"Loaded {len(documents)} document segments from {folder_path}")
+    return documents
+
+
+def _load_file(file_path: str, base_path: str) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    rel_path = os.path.relpath(file_path, base_path)
+
+    _, ext = os.path.splitext(file_path)
+    ext = ext.lower()
+
+    if ext in EXT_PDF:
+        docs = _process_pdf(file_path, rel_path)
+        documents.extend(docs)
+    elif ext in EXT_TEXT:
+        docs = _process_text_or_code(file_path, rel_path, "text")
+        documents.extend(docs)
+    elif ext in EXT_CODE:
+        docs = _process_text_or_code(file_path, rel_path, "code")
+        documents.extend(docs)
+    else:
+        logger.debug(f"Skipping unsupported file type: {rel_path}")
+
     return documents
 
 def _process_pdf(file_path: str, rel_path: str) -> List[Dict[str, Any]]:
