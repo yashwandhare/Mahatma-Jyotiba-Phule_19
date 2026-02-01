@@ -8,8 +8,9 @@ from fastapi import APIRouter, File, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 
-from backend.app.rag import retriever, generator, loader, chunker, store
+from backend.app.rag import retriever, generator, store, indexer
 from backend.app.rag.intent import detect_intent, get_retrieval_strategy, QueryIntent
+from backend.app.core.errors import get_error_message
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -36,11 +37,12 @@ class IndexRequest(BaseModel):
 
 
 class IndexResponse(BaseModel):
-    status: str
-    message: str
-    segments_indexed: int
+    documents_indexed: int
     chunks_indexed: int
-    collection_count: int
+    files_skipped: int
+    index_cleared: bool
+    chunks_removed: int
+    final_index_size: int
 
 
 class DocumentInfo(BaseModel):
@@ -58,7 +60,7 @@ class DocumentsResponse(BaseModel):
 async def list_documents():
     """List all indexed documents with metadata."""
     try:
-        collection = store.get_collection()
+        collection = store.ensure_collection_ready()
         total_chunks = collection.count()
         
         if total_chunks == 0:
@@ -91,6 +93,16 @@ async def list_documents():
             documents=documents
         )
         
+    except store.IndexStateError:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "total_chunks": 0,
+                "total_documents": 0,
+                "documents": [],
+                "error": get_error_message("vector_store_unavailable"),
+            },
+        )
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         return JSONResponse(
@@ -99,7 +111,7 @@ async def list_documents():
                 "total_chunks": 0,
                 "total_documents": 0,
                 "documents": [],
-                "error": "Failed to retrieve document list"
+                "error": get_error_message("documents_list_failed")
             }
         )
 
@@ -145,7 +157,15 @@ async def ask_question(request: AskRequest):
             sources=generation_result["sources"],
             intent=query_intent.value
         )
-        
+    except store.IndexStateError:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "answer": get_error_message("vector_store_unavailable"),
+                "sources": [],
+                "intent": "error",
+            },
+        )
     except ValueError as e:
         logger.warning(f"Validation error: {str(e)}")
         return JSONResponse(
@@ -161,63 +181,64 @@ async def ask_question(request: AskRequest):
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
-                "answer": "Error: An internal error occurred while processing your request.",
+                "answer": f"Error: {get_error_message('generic')}",
                 "sources": [],
                 "intent": "error"
             }
         )
 
 
-def _index_documents(docs: List[dict], clear_index: bool) -> IndexResponse:
-    if clear_index:
-        store.clear_index()
-
-    collection = store.get_collection()
-    before = collection.count()
-
-    chunker_inst = chunker.Chunker()
-    chunks = chunker_inst.chunk(docs)
-    store.index_chunks(chunks)
-
-    after = collection.count()
-
-    return IndexResponse(
-        status="ok",
-        message="Indexing complete",
-        segments_indexed=len(docs),
-        chunks_indexed=len(chunks),
-        collection_count=after,
-    )
-
-
 @router.post("/index", response_model=IndexResponse, status_code=status.HTTP_200_OK)
 async def index_paths(payload: IndexRequest):
     try:
-        docs = loader.load_inputs(payload.paths)
-        if not docs:
+        result = indexer.index_paths(payload.paths, clear_index=payload.clear_index)
+
+        if result.documents_indexed == 0:
+            result_dict = result.to_dict()
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={
-                    "status": "error",
-                    "message": "No valid documents found for provided paths.",
-                    "segments_indexed": 0,
-                    "chunks_indexed": 0,
-                    "collection_count": store.get_collection().count(),
+                    **result_dict,
+                    "error": get_error_message("no_valid_documents"),
                 },
             )
+        return IndexResponse(**result.to_dict())
 
-        return _index_documents(docs, payload.clear_index)
-
-    except Exception as e:
-        logger.error(f"Internal error during /index: {e}")
+    except store.IndexStateError:
+        result = indexer.IndexingResult(
+            documents_indexed=0,
+            chunks_indexed=0,
+            files_skipped=0,
+            index_cleared=False,
+            chunks_removed=0,
+            final_index_size=0,
+        )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
-                "status": "error",
-                "message": "Failed to index documents.",
-                "segments_indexed": 0,
-                "chunks_indexed": 0,
-                "collection_count": store.get_collection().count(),
+                **result.to_dict(),
+                "error": get_error_message("vector_store_unavailable"),
+            },
+        )
+    except Exception as e:
+        logger.error(f"Internal error during /index: {e}")
+        try:
+            final_count = store.ensure_collection_ready().count()
+        except store.IndexStateError:
+            final_count = 0
+        result = indexer.IndexingResult(
+            documents_indexed=0,
+            chunks_indexed=0,
+            files_skipped=0,
+            index_cleared=False,
+            chunks_removed=0,
+            final_index_size=final_count,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                **result.to_dict(),
+                "error": get_error_message("indexing_failed"),
             },
         )
 
@@ -225,6 +246,10 @@ async def index_paths(payload: IndexRequest):
 @router.post("/upload", response_model=IndexResponse, status_code=status.HTTP_200_OK)
 async def upload_files(files: List[UploadFile] = File(...), clear_index: bool = False):
     if not files:
+        try:
+            collection_count = store.ensure_collection_ready().count()
+        except store.IndexStateError:
+            collection_count = 0
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
@@ -232,7 +257,7 @@ async def upload_files(files: List[UploadFile] = File(...), clear_index: bool = 
                 "message": "No files uploaded.",
                 "segments_indexed": 0,
                 "chunks_indexed": 0,
-                "collection_count": store.get_collection().count(),
+                "collection_count": collection_count,
             },
         )
 
@@ -247,31 +272,53 @@ async def upload_files(files: List[UploadFile] = File(...), clear_index: bool = 
                 shutil.copyfileobj(file.file, f)
             saved_paths.append(str(dest))
 
-        docs = loader.load_inputs(saved_paths)
-        if not docs:
+        result = indexer.index_paths(saved_paths, clear_index=clear_index)
+        if result.documents_indexed == 0:
+            result_dict = result.to_dict()
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={
-                    "status": "error",
-                    "message": "Uploaded files are empty or unsupported.",
-                    "segments_indexed": 0,
-                    "chunks_indexed": 0,
-                    "collection_count": store.get_collection().count(),
+                    **result_dict,
+                    "error": get_error_message("upload_empty"),
                 },
             )
+        return IndexResponse(**result.to_dict())
 
-        return _index_documents(docs, clear_index)
-
-    except Exception as e:
-        logger.error(f"Internal error during /upload: {e}")
+    except store.IndexStateError:
+        result = indexer.IndexingResult(
+            documents_indexed=0,
+            chunks_indexed=0,
+            files_skipped=0,
+            index_cleared=False,
+            chunks_removed=0,
+            final_index_size=0,
+        )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
-                "status": "error",
-                "message": "Failed to process uploaded files.",
-                "segments_indexed": 0,
-                "chunks_indexed": 0,
-                "collection_count": store.get_collection().count(),
+                **result.to_dict(),
+                "error": get_error_message("vector_store_unavailable"),
+            },
+        )
+    except Exception as e:
+        logger.error(f"Internal error during /upload: {e}")
+        try:
+            final_count = store.ensure_collection_ready().count()
+        except store.IndexStateError:
+            final_count = 0
+        result = indexer.IndexingResult(
+            documents_indexed=0,
+            chunks_indexed=0,
+            files_skipped=0,
+            index_cleared=False,
+            chunks_removed=0,
+            final_index_size=final_count,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                **result.to_dict(),
+                "error": get_error_message("indexing_failed"),
             },
         )
     finally:
