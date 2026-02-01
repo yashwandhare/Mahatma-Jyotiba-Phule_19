@@ -1,5 +1,6 @@
 import logging
 from typing import List, Dict, Any, Optional
+import threading
 import chromadb
 from sentence_transformers import SentenceTransformer
 from chromadb.errors import NotFoundError
@@ -10,6 +11,10 @@ logger = logging.getLogger(__name__)
 _client: Optional[chromadb.PersistentClient] = None
 _collection: Optional[chromadb.Collection] = None
 _model: Optional[SentenceTransformer] = None
+_lock = threading.Lock()  # Thread-safe access
+
+# Batching configuration
+BATCH_SIZE = 500  # Process up to 500 chunks at a time to prevent OOM
 
 def _get_model() -> SentenceTransformer:
     """Lazy load embedding model."""
@@ -40,69 +45,88 @@ def get_collection() -> chromadb.Collection:
     return _collection
 
 def index_chunks(chunks: List[Dict[str, Any]]) -> None:
-    """Embed and store chunks in vector database."""
+    """
+    Embed and store chunks in vector database with batching.
+    Thread-safe with batching to prevent OOM on large datasets.
+    """
     if not chunks:
         logger.warning("No chunks provided to index.")
         return
 
     logger.info(f"Preparing to index {len(chunks)} chunks...")
     
-    collection = get_collection()
-    model = _get_model()
+    with _lock:
+        collection = get_collection()
+        model = _get_model()
 
-    ids = []
-    documents = []
-    metadatas = []
-    
-    for chunk in chunks:
-        chunk_text = chunk.get("text", "")
-        if not chunk_text.strip():
-            continue
-            
-        chunk_meta = chunk.get("metadata", {}).copy()
-        chunk_id = chunk_meta.get("chunk_id")
+        total_indexed = 0
         
-        if not chunk_id:
-            logger.warning("Skipping chunk without ID.")
-            continue
+        # Process in batches
+        for batch_start in range(0, len(chunks), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(chunks))
+            batch = chunks[batch_start:batch_end]
+            
+            logger.info(f"Processing batch {batch_start + 1}-{batch_end} of {len(chunks)}")
+            
+            ids = []
+            documents = []
+            metadatas = []
+            
+            for chunk in batch:
+                chunk_text = chunk.get("text", "")
+                if not chunk_text.strip():
+                    continue
+                    
+                chunk_meta = chunk.get("metadata", {}).copy()
+                chunk_id = chunk_meta.get("chunk_id")
+                
+                if not chunk_id:
+                    logger.warning("Skipping chunk without ID.")
+                    continue
 
-        # ChromaDB requires non-None values
-        safe_meta = {}
-        for k, v in chunk_meta.items():
-            if v is None:
-                if k in ["page", "line_start", "line_end"]:
-                    safe_meta[k] = -1
-                else:
-                    safe_meta[k] = ""
-            else:
-                safe_meta[k] = v
+                # ChromaDB requires non-None values
+                safe_meta = {}
+                for k, v in chunk_meta.items():
+                    if v is None:
+                        if k in ["page", "line_start", "line_end"]:
+                            safe_meta[k] = -1
+                        else:
+                            safe_meta[k] = ""
+                    else:
+                        safe_meta[k] = v
 
-        ids.append(chunk_id)
-        documents.append(chunk_text)
-        metadatas.append(safe_meta)
+                ids.append(chunk_id)
+                documents.append(chunk_text)
+                metadatas.append(safe_meta)
 
-    # Generate Embeddings
-    logger.info("Generating embeddings...")
-    embeddings = model.encode(documents, convert_to_tensor=False).tolist()
+            if not ids:
+                continue
 
-    logger.info(f"Upserting {len(ids)} chunks to Vector DB...")
-    collection.upsert(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents,
-        metadatas=metadatas
-    )
-    
-    logger.info("Indexing complete.")
+            # Generate Embeddings for batch
+            logger.info(f"Generating embeddings for {len(documents)} documents...")
+            embeddings = model.encode(documents, convert_to_tensor=False, show_progress_bar=True).tolist()
+
+            logger.info(f"Upserting {len(ids)} chunks to Vector DB...")
+            collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas
+            )
+            
+            total_indexed += len(ids)
+        
+        logger.info(f"Indexing complete. Total indexed: {total_indexed}")
 
 
 def clear_index():
-    """Delete vector collection and reset."""
-    client = _get_db_client()
-    global _collection
-    try:
-        client.delete_collection(config.COLLECTION_NAME)
-        _collection = None
-        logger.info("Index cleared.")
-    except NotFoundError:
-        logger.info("No existing collection to clear.")
+    """Delete vector collection and reset. Thread-safe."""
+    with _lock:
+        client = _get_db_client()
+        global _collection
+        try:
+            client.delete_collection(config.COLLECTION_NAME)
+            _collection = None
+            logger.info("Index cleared.")
+        except NotFoundError:
+            logger.info("No existing collection to clear.")

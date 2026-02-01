@@ -1,99 +1,146 @@
+"""Answer generation with LLM orchestration and intent-aware prompts."""
+
 import logging
-from typing import List, Dict, Any
-from openai import OpenAI
+from typing import List, Dict, Any, Optional
+
 from backend.app.core import config
+from backend.app.rag.orchestrator import get_orchestrator, ProviderUnavailable, ProviderTimeout
+from backend.app.rag.intent import QueryIntent
 
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client for Groq
-if config.GROQ_API_KEY:
-    client = OpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=config.GROQ_API_KEY
-    )
-else:
-    client = None
-    logger.error("GROQ_API_KEY not configured. Generation will fail.")
 
-def generate_answer(query: str, retrieved_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Generate grounded answer or refuse if context is empty."""
-    if not retrieved_chunks:
-        logger.info("Refusal triggered: No chunks provided.")
-        return {
-            "answer": config.REFUSAL_RESPONSE,
-            "sources": []
-        }
-
-    if not client:
-        logger.error("Generation attempted without API client.")
-        return {
-            "answer": "Error: Groq API key not configured.",
-            "sources": []
-        }
-
-    # 2. Prepare Context
+def _build_context(retrieved_chunks: List[Dict[str, Any]]) -> str:
+    """Build context string from retrieved chunks."""
     context_text = ""
     for i, chunk in enumerate(retrieved_chunks):
         text = chunk.get("text", "").strip()
         context_text += f"--- CHUNK {i+1} ---\n{text}\n\n"
+    return context_text
 
-    # Extract sources without LLM hallucination
+
+def _collect_sources(retrieved_chunks: List[Dict[str, Any]]) -> List[str]:
+    """Extract unique source references from chunks."""
     unique_sources = set()
     for chunk in retrieved_chunks:
         meta = chunk.get("metadata", {})
         filename = meta.get("filename", "unknown")
-        
+
         if meta.get("page") is not None and meta.get("page") != -1:
             loc = f"page {meta['page']}"
         elif meta.get("line_start") is not None and meta.get("line_start") != -1:
             loc = f"lines {meta['line_start']}-{meta.get('line_end', '?')}"
         else:
             loc = "unknown location"
-            
+
         unique_sources.add(f"{filename} ({loc})")
+
+    return sorted(list(unique_sources))
+
+
+def _system_prompt(intent: QueryIntent) -> str:
+    """Get system prompt based on query intent."""
+    if intent == QueryIntent.FACTUAL:
+        return (
+            "You are RAGex, a precise document assistant.\n"
+            "1. Answer the user query STRICTLY using the provided Context.\n"
+            "2. Do NOT use outside knowledge. Do NOT guess.\n"
+            "3. If the answer is not contained in the Context, output EXACTLY: "
+            f"'{config.REFUSAL_RESPONSE}'\n"
+            "4. Be concise and direct."
+        )
     
-    sorted_sources = sorted(list(unique_sources))
-
-    system_prompt = (
-        "You are RAGex, a precise document assistant.\n"
-        "1. Answer the user query STRICTLY using the provided Context.\n"
-        "2. Do NOT use outside knowledge. Do NOT guess.\n"
-        "3. If the answer is not contained in the Context, output EXACTLY: "
-        f"'{config.REFUSAL_RESPONSE}'\n"
-        "4. Be concise and direct."
+    elif intent == QueryIntent.SUMMARY:
+        return (
+            "You are RAGex, a document summarization assistant.\n"
+            "1. Summarize the key points from the provided Context.\n"
+            "2. Focus on main ideas, themes, and important details.\n"
+            "3. Structure your summary clearly with bullet points or paragraphs.\n"
+            "4. Use ONLY information from the Context provided.\n"
+            "5. Be comprehensive but concise."
+        )
+    
+    elif intent == QueryIntent.DESCRIPTION:
+        return (
+            "You are RAGex, a document analysis assistant.\n"
+            "1. Describe what the document(s) are about based on the Context.\n"
+            "2. Identify the main topics, purpose, and scope.\n"
+            "3. Mention the type of content (technical, educational, etc.).\n"
+            "4. Use ONLY information from the Context provided.\n"
+            "5. Be clear and informative."
+        )
+    
+    # Fallback
+    return (
+        "You are RAGex, a helpful document assistant.\n"
+        "Answer the user's question using the provided Context."
     )
 
-    user_message = (
-        f"Context:\n{context_text}\n\n"
-        f"Question: {query}"
-    )
+
+def generate_answer(
+    query: str,
+    retrieved_chunks: List[Dict[str, Any]],
+    intent: Optional[QueryIntent] = None,
+    strict_refusal: bool = True,
+) -> Dict[str, Any]:
+    """
+    Generate answer from retrieved chunks with intent-aware prompts.
+    
+    Args:
+        query: User question
+        retrieved_chunks: List of retrieved document chunks with metadata
+        intent: Query intent (factual, summary, description)
+        strict_refusal: Whether to refuse when no chunks (only for factual queries)
+        
+    Returns:
+        Dict with 'answer' and 'sources' keys
+    """
+    intent = intent or QueryIntent.FACTUAL
+    
+    # Only refuse for factual queries with no chunks
+    if not retrieved_chunks and strict_refusal:
+        logger.info("Refusal triggered: No chunks provided.")
+        return {
+            "answer": config.REFUSAL_RESPONSE,
+            "sources": []
+        }
+    
+    # For summary/description, handle empty case gracefully
+    if not retrieved_chunks:
+        return {
+            "answer": "No documents have been indexed yet. Please upload or index documents first.",
+            "sources": []
+        }
+
+    context_text = _build_context(retrieved_chunks)
+    sorted_sources = _collect_sources(retrieved_chunks)
+
+    system_prompt = _system_prompt(intent)
+    user_message = f"Context:\n{context_text}\n\nQuestion: {query}"
 
     try:
-        logger.info(f"Generating answer with model {config.GROQ_MODEL}...")
-        response = client.chat.completions.create(
-            model=config.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=config.GENERATION_TEMPERATURE,
-            max_tokens=config.GENERATION_MAX_TOKENS
-        )
-        
-        final_answer = response.choices[0].message.content.strip()
+        orchestrator = get_orchestrator()
+        final_answer = orchestrator.generate(system_prompt, user_message)
 
-        # Enforce exact refusal format
-        if "not found in indexed documents" in final_answer.lower():
-            final_answer = config.REFUSAL_RESPONSE
-            sorted_sources = []
+        # Normalize refusals only for factual intent
+        if intent == QueryIntent.FACTUAL:
+            if "not found in indexed documents" in final_answer.lower():
+                final_answer = config.REFUSAL_RESPONSE
+                sorted_sources = []
 
         return {
             "answer": final_answer,
             "sources": sorted_sources
         }
 
+    except (ProviderUnavailable, ProviderTimeout) as e:
+        logger.error(f"Provider error: {e}")
+        return {
+            "answer": "Error: LLM provider unavailable or timed out. Please try again.",
+            "sources": []
+        }
     except Exception as e:
-        logger.error(f"Generation failed: {str(e)}")
+        logger.error(f"Generation failed: {str(e)}", exc_info=True)
         return {
             "answer": "Error: Failed to generate response from LLM.",
             "sources": []
