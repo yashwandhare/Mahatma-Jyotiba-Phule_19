@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from backend.app.core import config
 from backend.app.rag.orchestrator import get_orchestrator, ProviderUnavailable, ProviderTimeout
 from backend.app.rag.intent import QueryIntent
+from backend.app.core.errors import get_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +123,11 @@ def generate_answer(
         orchestrator = get_orchestrator()
         final_answer = orchestrator.generate(system_prompt, user_message)
 
+        # INVARIANT: Refusal response must be exact (INVARIANTS.md §5)
         # Normalize refusals only for factual intent
         if intent == QueryIntent.FACTUAL:
             if "not found in indexed documents" in final_answer.lower():
+                # GUARD: Use exact configured refusal string, never paraphrase
                 final_answer = config.REFUSAL_RESPONSE
                 sorted_sources = []
 
@@ -133,10 +136,18 @@ def generate_answer(
             "sources": sorted_sources
         }
 
-    except (ProviderUnavailable, ProviderTimeout) as e:
-        logger.error(f"Provider error: {e}")
+    except ProviderUnavailable as e:
+        logger.error(f"Provider unavailable: {e}")
+        message = str(e).strip() or get_error_message("provider_unavailable")
         return {
-            "answer": "Error: LLM provider unavailable or timed out. Please try again.",
+            "answer": f"Error: {message}",
+            "sources": []
+        }
+    except ProviderTimeout as e:
+        logger.error(f"Provider timeout: {e}")
+        message = get_error_message("provider_timeout")
+        return {
+            "answer": f"Error: {message}",
             "sources": []
         }
     except Exception as e:

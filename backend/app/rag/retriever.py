@@ -15,6 +15,9 @@ def retrieve(
     """
     Intent-aware retrieval with configurable strategies.
     
+    INVARIANT: Queries are read-only - never mutate the vector store.
+    See INVARIANTS.md §2 for details.
+    
     Args:
         query: Search query
         top_k: Number of chunks to retrieve (overrides config)
@@ -27,7 +30,7 @@ def retrieve(
     if not query.strip():
         return {"chunks": []}
 
-    collection = store.get_collection()
+    collection = store.ensure_collection_ready()
     model = store._get_model()
 
     query_embedding = model.encode(query, convert_to_tensor=False).tolist()
@@ -41,6 +44,8 @@ def retrieve(
             n_results=candidate_k,
             include=["documents", "metadatas", "distances"]
         )
+    except store.IndexStateError:
+        raise
     except Exception as e:
         logger.error(f"ChromaDB query failed: {e}")
         return {"chunks": []}

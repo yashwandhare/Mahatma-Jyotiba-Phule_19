@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 import urllib.error
 import urllib.request
+import urllib.parse
 import json
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 
 from backend.app.core import config
+from backend.app.core.errors import get_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ class ProviderTimeout(LLMProviderError):
 
 
 class _GroqProvider:
-    """Groq API client with retry logic."""
+    """Groq API client with standardized retry logic and error handling."""
     
     def __init__(self):
         self._client: Optional[OpenAI] = None
@@ -49,7 +51,7 @@ class _GroqProvider:
     def _get_client(self) -> OpenAI:
         if self._client is None:
             if not config.GROQ_API_KEY:
-                raise ProviderUnavailable("GROQ_API_KEY not configured.")
+                raise ProviderUnavailable(get_error_message("provider_unavailable"))
             
             self._client = OpenAI(
                 base_url="https://api.groq.com/openai/v1",
@@ -59,16 +61,25 @@ class _GroqProvider:
         return self._client
     
     def generate(self, system_prompt: str, user_message: str, llm_config: LLMConfig) -> str:
-        """Generate completion with retry logic."""
+        """
+        Generate completion with standardized retry logic.
+        
+        Provider Interface Contract:
+        - Retries: 2 attempts with exponential backoff
+        - Timeout errors → ProviderTimeout
+        - Connection/availability errors → ProviderUnavailable
+        - Empty responses → ProviderUnavailable
+        """
         if config.OFFLINE_MODE:
-            raise ProviderUnavailable("Offline mode enabled; Groq is disabled.")
+            raise ProviderUnavailable(get_error_message("offline_mode"))
         
         client = self._get_client()
         last_error = None
+        is_timeout = False
         
         for attempt in range(llm_config.max_retries + 1):
             try:
-                logger.info(f"Groq request (attempt {attempt + 1}/{llm_config.max_retries + 1})")
+                logger.info(f"LLM request (attempt {attempt + 1}/{llm_config.max_retries + 1})")
                 
                 response = client.chat.completions.create(
                     model=llm_config.model,
@@ -79,36 +90,56 @@ class _GroqProvider:
                     temperature=llm_config.temperature,
                     max_tokens=llm_config.max_tokens
                 )
-                return response.choices[0].message.content.strip()
+                
+                content = response.choices[0].message.content
+                if not content or not content.strip():
+                    raise ProviderUnavailable("Provider returned empty response.")
+                
+                return content.strip()
                 
             except APITimeoutError as e:
                 last_error = e
-                logger.warning(f"Groq timeout on attempt {attempt + 1}: {e}")
+                is_timeout = True
+                logger.warning(f"Request timeout on attempt {attempt + 1}: {e}")
                 if attempt < llm_config.max_retries:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
                     
-            except RateLimitError as e:
+            except (RateLimitError, APIError) as e:
                 last_error = e
-                logger.warning(f"Groq rate limit on attempt {attempt + 1}: {e}")
+                logger.warning(f"Provider error on attempt {attempt + 1}: {e}")
                 if attempt < llm_config.max_retries:
-                    time.sleep(5)
-                    
-            except APIError as e:
+                    time.sleep(2 ** attempt)
+                else:
+                    break
+            
+            except Exception as e:
                 last_error = e
-                logger.error(f"Groq API error on attempt {attempt + 1}: {e}")
+                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
                 if attempt < llm_config.max_retries:
-                    time.sleep(1)
+                    time.sleep(2 ** attempt)
                 else:
                     break
         
-        raise ProviderTimeout(f"Groq failed after {llm_config.max_retries + 1} attempts: {last_error}")
+        # Normalize error types: timeouts always raise ProviderTimeout
+        if is_timeout:
+            raise ProviderTimeout(get_error_message("provider_timeout"))
+        else:
+            raise ProviderUnavailable(get_error_message("provider_unavailable"))
 
 
 class _OllamaProvider:
-    """Ollama local API client with retry logic."""
+    """Ollama local API client with standardized retry logic and error handling."""
     
     def generate(self, system_prompt: str, user_message: str, llm_config: LLMConfig) -> str:
-        """Generate completion with retry logic."""
+        """
+        Generate completion with standardized retry logic.
+        
+        Provider Interface Contract:
+        - Retries: 2 attempts with exponential backoff
+        - Timeout errors → ProviderTimeout
+        - Connection/availability errors → ProviderUnavailable
+        - Empty responses → ProviderUnavailable
+        """
         url = f"{config.OLLAMA_BASE_URL}/api/chat"
         payload = {
             "model": llm_config.model,
@@ -127,9 +158,11 @@ class _OllamaProvider:
         )
         
         last_error = None
+        is_timeout = False
+        
         for attempt in range(llm_config.max_retries + 1):
             try:
-                logger.info(f"Ollama request (attempt {attempt + 1}/{llm_config.max_retries + 1})")
+                logger.info(f"LLM request (attempt {attempt + 1}/{llm_config.max_retries + 1})")
                 
                 with urllib.request.urlopen(request, timeout=llm_config.timeout) as response:
                     body = response.read().decode("utf-8")
@@ -138,34 +171,84 @@ class _OllamaProvider:
                 message = parsed.get("message", {})
                 content = message.get("content") or parsed.get("response", "")
                 
-                if not content:
-                    raise RuntimeError("Ollama returned empty response.")
+                if not content or not content.strip():
+                    raise ProviderUnavailable("Provider returned empty response.")
                 
                 return content.strip()
                 
-            except urllib.error.URLError as e:
+            except TimeoutError as e:
                 last_error = e
-                logger.warning(f"Ollama connection error on attempt {attempt + 1}: {e}")
+                is_timeout = True
+                logger.warning(f"Request timeout on attempt {attempt + 1}: {e}")
                 if attempt < llm_config.max_retries:
                     time.sleep(2 ** attempt)
                     
+            except urllib.error.URLError as e:
+                last_error = e
+                # URLError with timeout reason is treated as timeout
+                if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
+                    is_timeout = True
+                logger.warning(f"Provider error on attempt {attempt + 1}: {e}")
+                if attempt < llm_config.max_retries:
+                    time.sleep(2 ** attempt)
+                else:
+                    break
+                    
             except Exception as e:
                 last_error = e
-                logger.error(f"Ollama error on attempt {attempt + 1}: {e}")
+                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
                 if attempt < llm_config.max_retries:
-                    time.sleep(1)
+                    time.sleep(2 ** attempt)
                 else:
                     break
         
-        raise ProviderUnavailable(f"Ollama unreachable at {config.OLLAMA_BASE_URL} after {llm_config.max_retries + 1} attempts: {last_error}")
+        # Normalize error types: timeouts always raise ProviderTimeout
+        if is_timeout:
+            raise ProviderTimeout(get_error_message("provider_timeout"))
+        else:
+            raise ProviderUnavailable(get_error_message("provider_unavailable"))
 
 
 class LLMOrchestrator:
-    """Single orchestration point for all LLM interactions."""
+    """
+    Single orchestration point for all LLM interactions with strict provider interface.
+    
+    Provider Interface Contract (enforced for both Groq and Ollama):
+    - Input: system_prompt, user_message, LLMConfig (model, temp, tokens, timeout)
+    - Output: text string (stripped, non-empty)
+    - Retry behavior: 2 retries with exponential backoff (2^attempt seconds)
+    - Timeout handling: All timeout errors → ProviderTimeout exception
+    - Availability errors: Connection/config/empty response → ProviderUnavailable
+    - Error messages: Normalized via get_error_message(), no provider-specific text
+    - Logging: Generic "LLM request" messages, no provider name in output
+    
+    This ensures providers are completely interchangeable - callers cannot detect
+    which provider is active based on errors, timing, or response structure.
+    """
     
     def __init__(self):
         self._groq = _GroqProvider()
         self._ollama = _OllamaProvider()
+
+    def _ensure_offline_policy(self, provider: str) -> None:
+        """
+        Enforce offline-mode restrictions before any network call.
+        
+        INVARIANT: OFFLINE_MODE=1 forbids all remote network calls.
+        See INVARIANTS.md §3 for details.
+        """
+        if not config.OFFLINE_MODE:
+            return
+
+        # GUARD: No non-Ollama providers in offline mode
+        if provider != "ollama":
+            raise ProviderUnavailable(get_error_message("offline_mode"))
+
+        parsed = urllib.parse.urlparse(config.OLLAMA_BASE_URL)
+        host = (parsed.hostname or "").lower()
+        local_hosts = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+        if not host or (host not in local_hosts and not host.startswith("127.")):
+            raise ProviderUnavailable(get_error_message("offline_local_ollama"))
     
     def generate(
         self,
@@ -193,11 +276,20 @@ class LLMOrchestrator:
         Raises:
             ProviderUnavailable: Provider is offline or misconfigured
             ProviderTimeout: Request timed out with retries
+            ValueError: Critical configuration is missing or invalid
         """
+        # Validate runtime requirements before attempting generation
+        try:
+            config.settings.validate_runtime_requirements()
+        except ValueError as e:
+            raise ProviderUnavailable(str(e))
+        
         # Use overrides or defaults
         provider = (provider or config.RAG_PROVIDER).lower()
         model = model or config.RAG_MODEL_NAME
         
+        self._ensure_offline_policy(provider)
+
         llm_config = LLMConfig(
             model=model,
             temperature=temperature or config.GENERATION_TEMPERATURE,
@@ -206,7 +298,7 @@ class LLMOrchestrator:
             max_retries=2,
         )
         
-        logger.info(f"Orchestrating LLM: provider={provider}, model={model}")
+        logger.info(f"Generating LLM response: model={model}")
         
         if provider == "groq":
             return self._groq.generate(system_prompt, user_message, llm_config)

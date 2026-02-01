@@ -1,8 +1,11 @@
 import os
 import logging
 import hashlib
-from typing import List, Dict, Optional, Any, Iterable
+from typing import List, Dict, Optional, Any, Iterable, Tuple, Set
 from pypdf import PdfReader
+from pathlib import Path
+
+from backend.app.core.files import collect_valid_files
 
 logger = logging.getLogger(__name__)
 
@@ -11,64 +14,58 @@ EXT_TEXT = {'.txt', '.md', '.markdown'}
 EXT_CODE = {'.py', '.js', '.java', '.ts', '.cpp', '.c', '.h', '.html', '.css', '.json', '.yaml', '.yml', '.sh'}
 LINES_PER_SEGMENT = 50
 
-def load_inputs(paths: Iterable[str]) -> List[Dict[str, Any]]:
-    """Ingest a mix of files and folders and extract text with metadata."""
+def load_inputs(paths: Iterable[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Ingest files/folders with centralized validation.
+
+    Returns (documents, errors) where errors list skipped files.
+    """
     documents: List[Dict[str, Any]] = []
-    normalized_paths = [p for p in (paths or []) if p and str(p).strip()]
+    normalized_paths: List[str] = []
+    seen_inputs: Set[str] = set()
+
+    for raw in paths or []:
+        if not raw or not str(raw).strip():
+            continue
+        normalized = str(raw).strip()
+        if normalized in seen_inputs:
+            logger.info("Skipping duplicate input path: %s", normalized)
+            continue
+        seen_inputs.add(normalized)
+        normalized_paths.append(normalized)
 
     if not normalized_paths:
         logger.error("No input paths provided.")
-        return []
+        return [], ["No input paths provided"]
 
-    for raw_path in normalized_paths:
-        path = os.path.abspath(raw_path)
-        if not os.path.exists(path):
-            logger.warning(f"Skipping missing path: {raw_path}")
+    valid_files, errors = collect_valid_files(normalized_paths)
+
+    if not valid_files:
+        logger.error("No valid files after validation.")
+        return [], errors
+
+    resolved_inputs = []
+    for raw in normalized_paths:
+        try:
+            resolved_inputs.append(Path(raw).expanduser().resolve())
+        except Exception:
             continue
 
-        if os.path.isdir(path):
-            documents.extend(_load_folder(path))
-        else:
-            documents.extend(_load_file(path, base_path=os.path.dirname(path)))
+    for file_path in valid_files:
+        file_path_obj = Path(file_path).resolve()
 
-    logger.info(f"Loaded {len(documents)} document segments from {len(normalized_paths)} inputs")
-    return documents
-
-
-def load_files(folder_path: str) -> List[Dict[str, Any]]:
-    """Backward-compatible folder ingestion."""
-    return _load_folder(folder_path)
-
-
-def _load_folder(folder_path: str) -> List[Dict[str, Any]]:
-    documents: List[Dict[str, Any]] = []
-
-    if not folder_path or not folder_path.strip():
-        logger.error("Empty folder path provided.")
-        return []
-
-    if not os.path.exists(folder_path):
-        logger.error(f"Path does not exist: {folder_path}")
-        return []
-
-    if not os.path.isdir(folder_path):
-        logger.error(f"Path is not a directory: {folder_path}")
-        return []
-
-    logger.info(f"Scanning directory: {folder_path}")
-
-    for root, dirs, files in os.walk(folder_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-
-        for file in files:
-            if file.startswith('.'):
+        base_path = file_path_obj.parent
+        for root in resolved_inputs:
+            try:
+                file_path_obj.relative_to(root)
+                base_path = root
+                break
+            except ValueError:
                 continue
 
-            file_path = os.path.join(root, file)
-            documents.extend(_load_file(file_path, base_path=folder_path))
+        documents.extend(_load_file(str(file_path_obj), base_path=str(base_path)))
 
-    logger.info(f"Loaded {len(documents)} document segments from {folder_path}")
-    return documents
+    logger.info(f"Loaded {len(documents)} document segments from {len(valid_files)} validated files")
+    return documents, errors
 
 
 def _load_file(file_path: str, base_path: str) -> List[Dict[str, Any]]:
