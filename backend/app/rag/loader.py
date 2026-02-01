@@ -15,8 +15,16 @@ def load_files(folder_path: str) -> List[Dict[str, Any]]:
     """Scan folder recursively and extract text with metadata."""
     documents = []
     
+    if not folder_path or not folder_path.strip():
+        logger.error("Empty folder path provided.")
+        return []
+    
+    if not os.path.exists(folder_path):
+        logger.error(f"Path does not exist: {folder_path}")
+        return []
+    
     if not os.path.isdir(folder_path):
-        logger.error(f"Invalid directory path: {folder_path}")
+        logger.error(f"Path is not a directory: {folder_path}")
         return []
 
     logger.info(f"Scanning directory: {folder_path}")
@@ -55,22 +63,30 @@ def _process_pdf(file_path: str, rel_path: str) -> List[Dict[str, Any]]:
     docs = []
     try:
         reader = PdfReader(file_path)
+        if not reader.pages:
+            logger.warning(f"PDF has no pages: {rel_path}")
+            return []
+            
         for i, page_obj in enumerate(reader.pages):
-            text = page_obj.extract_text()
-            if text and text.strip():
-                page_num = i + 1
-                doc_id = _generate_doc_id(rel_path, page=page_num)
-                docs.append({
-                    "text": text,
-                    "metadata": {
-                        "doc_id": doc_id,
-                        "filename": rel_path,
-                        "file_type": "pdf",
-                        "page": page_num,
-                        "line_start": None,
-                        "line_end": None
-                    }
-                })
+            try:
+                text = page_obj.extract_text()
+                if text and text.strip():
+                    page_num = i + 1
+                    doc_id = _generate_doc_id(rel_path, page=page_num)
+                    docs.append({
+                        "text": text,
+                        "metadata": {
+                            "doc_id": doc_id,
+                            "filename": rel_path,
+                            "file_type": "pdf",
+                            "page": page_num,
+                            "line_start": None,
+                            "line_end": None
+                        }
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to extract page {i+1} from {rel_path}: {e}")
+                continue
     except Exception as e:
         logger.error(f"Error reading PDF {rel_path}: {e}")
     return docs

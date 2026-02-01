@@ -1,13 +1,9 @@
 import logging
 from typing import List, Dict, Any
 from backend.app.rag import store
+from backend.app.core import config
 
 logger = logging.getLogger(__name__)
-
-# Dynamic retrieval thresholds
-CANDIDATE_K = 20
-MIN_SCORE_THRESHOLD = 0.40
-DROP_OFF_THRESHOLD = 0.10
 
 def retrieve(query: str) -> Dict[str, Any]:
     """Dynamic retrieval with threshold-based refusal support."""
@@ -22,7 +18,7 @@ def retrieve(query: str) -> Dict[str, Any]:
     try:
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=CANDIDATE_K,
+            n_results=config.CANDIDATE_K,
             include=["documents", "metadatas", "distances"]
         )
     except Exception as e:
@@ -50,10 +46,11 @@ def retrieve(query: str) -> Dict[str, Any]:
         })
 
     # Threshold filtering
-    filtered_candidates = [c for c in candidates if c['score'] >= MIN_SCORE_THRESHOLD]
+    filtered_candidates = [c for c in candidates if c['score'] >= config.MIN_SCORE_THRESHOLD]
     
     if not filtered_candidates:
-        logger.info(f"Refusal Triggered: No chunks above threshold {MIN_SCORE_THRESHOLD}. Top score: {candidates[0]['score']:.3f} if candidates else 0")
+        top_score = candidates[0]['score'] if candidates else 0.0
+        logger.info(f"Refusal: No chunks above threshold {config.MIN_SCORE_THRESHOLD}. Top score: {top_score:.3f}")
         return {"chunks": []}
 
     filtered_candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -61,17 +58,15 @@ def retrieve(query: str) -> Dict[str, Any]:
     # Variable K via drop-off detection
     final_chunks = []
     if filtered_candidates:
-        # Always take the top result if it passed threshold
         final_chunks.append(filtered_candidates[0])
         
         for i in range(1, len(filtered_candidates)):
             prev_score = filtered_candidates[i-1]['score']
             current_score = filtered_candidates[i]['score']
-            
             drop = prev_score - current_score
             
-            if drop > DROP_OFF_THRESHOLD:
-                logger.info(f"Drop-off detected: {drop:.3f} at rank {i}. Cutting context.")
+            if drop > config.DROP_OFF_THRESHOLD:
+                logger.info(f"Drop-off detected: {drop:.3f} at rank {i}. Stopping.")
                 break
             
             final_chunks.append(filtered_candidates[i])

@@ -15,27 +15,31 @@ class Chunker:
         """Process documents and return chunks with preserved metadata."""
         all_chunks = []
         
+        if not documents:
+            logger.warning("No documents provided for chunking.")
+            return []
+        
         logger.info(f"Chunking {len(documents)} documents with size={self.chunk_size}, overlap={self.chunk_overlap}")
 
         for doc in documents:
             text = doc.get("text", "")
             metadata = doc.get("metadata", {})
             
-            if not text:
+            if not text or not text.strip():
                 continue
 
-            # Split text into chunks
             text_chunks = self._split_text(text)
 
             for i, chunk_text in enumerate(text_chunks):
+                if not chunk_text.strip():
+                    continue
+                    
                 source_id = metadata.get("doc_id", "unknown")
                 chunk_id = hashlib.md5(f"{source_id}_{i}_{chunk_text[:20]}".encode()).hexdigest()
 
                 chunk_metadata = metadata.copy()
                 chunk_metadata["chunk_id"] = chunk_id
                 chunk_metadata["source_doc_id"] = source_id
-                
-                # Inherit parent line range (already ~50 lines) for simplicity
 
                 all_chunks.append({
                     "text": chunk_text,

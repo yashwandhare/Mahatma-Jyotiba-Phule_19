@@ -1,34 +1,31 @@
-import os
 import logging
 from typing import List, Dict, Any
 from openai import OpenAI
+from backend.app.core import config
 
 logger = logging.getLogger(__name__)
 
-REFUSAL_RESPONSE = "Answer: Not found in indexed documents."
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
-if GROQ_API_KEY:
+# Initialize OpenAI client for Groq
+if config.GROQ_API_KEY:
     client = OpenAI(
         base_url="https://api.groq.com/openai/v1",
-        api_key=GROQ_API_KEY
+        api_key=config.GROQ_API_KEY
     )
 else:
     client = None
-    logger.warning("GROQ_API_KEY not found in environment variables.")
+    logger.error("GROQ_API_KEY not configured. Generation will fail.")
 
 def generate_answer(query: str, retrieved_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Generate grounded answer or refuse if context is empty."""
-    # 1. MANDATORY REFUSAL LOGIC (Pre-generation)
     if not retrieved_chunks:
         logger.info("Refusal triggered: No chunks provided.")
         return {
-            "answer": REFUSAL_RESPONSE,
+            "answer": config.REFUSAL_RESPONSE,
             "sources": []
         }
 
     if not client:
+        logger.error("Generation attempted without API client.")
         return {
             "answer": "Error: Groq API key not configured.",
             "sources": []
@@ -62,7 +59,7 @@ def generate_answer(query: str, retrieved_chunks: List[Dict[str, Any]]) -> Dict[
         "1. Answer the user query STRICTLY using the provided Context.\n"
         "2. Do NOT use outside knowledge. Do NOT guess.\n"
         "3. If the answer is not contained in the Context, output EXACTLY: "
-        f"'{REFUSAL_RESPONSE}'\n"
+        f"'{config.REFUSAL_RESPONSE}'\n"
         "4. Be concise and direct."
     )
 
@@ -72,23 +69,23 @@ def generate_answer(query: str, retrieved_chunks: List[Dict[str, Any]]) -> Dict[
     )
 
     try:
-        logger.info(f"Generating answer with model {GROQ_MODEL}...")
+        logger.info(f"Generating answer with model {config.GROQ_MODEL}...")
         response = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=config.GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            temperature=0.1,
-            max_tokens=500
+            temperature=config.GENERATION_TEMPERATURE,
+            max_tokens=config.GENERATION_MAX_TOKENS
         )
         
         final_answer = response.choices[0].message.content.strip()
 
         # Enforce exact refusal format
         if "not found in indexed documents" in final_answer.lower():
-            final_answer = REFUSAL_RESPONSE
-            sorted_sources = [] # No sources for a refusal
+            final_answer = config.REFUSAL_RESPONSE
+            sorted_sources = []
 
         return {
             "answer": final_answer,

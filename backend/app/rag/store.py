@@ -1,18 +1,11 @@
-import os
 import logging
 from typing import List, Dict, Any, Optional
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from chromadb.errors import NotFoundError
+from backend.app.core import config
 
 logger = logging.getLogger(__name__)
-
-# Paths relative to backend/
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DB_PATH = os.path.join(BASE_DIR, "data", "vectordb")
-COLLECTION_NAME = "ragex_chunks"
-MODEL_NAME = "all-MiniLM-L6-v2"
 
 _client: Optional[chromadb.PersistentClient] = None
 _collection: Optional[chromadb.Collection] = None
@@ -22,17 +15,18 @@ def _get_model() -> SentenceTransformer:
     """Lazy load embedding model."""
     global _model
     if _model is None:
-        logger.info(f"Loading embedding model: {MODEL_NAME}")
-        _model = SentenceTransformer(MODEL_NAME, device='cpu')
+        logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
+        _model = SentenceTransformer(config.EMBEDDING_MODEL, device='cpu')
     return _model
 
 def _get_db_client() -> chromadb.PersistentClient:
     """Lazy load ChromaDB client."""
     global _client
     if _client is None:
-        logger.info(f"Initializing Vector DB at: {DB_PATH}")
-        os.makedirs(DB_PATH, exist_ok=True)
-        _client = chromadb.PersistentClient(path=DB_PATH)
+        logger.info(f"Initializing Vector DB at: {config.DB_PATH}")
+        import os
+        os.makedirs(config.DB_PATH, exist_ok=True)
+        _client = chromadb.PersistentClient(path=config.DB_PATH)
     return _client
 
 def get_collection() -> chromadb.Collection:
@@ -41,7 +35,7 @@ def get_collection() -> chromadb.Collection:
     client = _get_db_client()
     
     if _collection is None:
-        _collection = client.get_or_create_collection(name=COLLECTION_NAME)
+        _collection = client.get_or_create_collection(name=config.COLLECTION_NAME)
     
     return _collection
 
@@ -103,10 +97,11 @@ def index_chunks(chunks: List[Dict[str, Any]]) -> None:
 
 
 def clear_index():
+    """Delete vector collection and reset."""
     client = _get_db_client()
     global _collection
     try:
-        client.delete_collection(COLLECTION_NAME)
+        client.delete_collection(config.COLLECTION_NAME)
         _collection = None
         logger.info("Index cleared.")
     except NotFoundError:
