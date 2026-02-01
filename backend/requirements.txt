@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+
+pydantic-settings
+python-dotenv
+
+chromadb>=0.4.18
+sentence-transformers
+torch>=2.2.0
+
+pypdf
+python-multipart
+
+openai    # for Groq-compatible client
+
+aiohttp

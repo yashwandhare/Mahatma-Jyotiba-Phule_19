@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+.env
+*.log
+data/vectordb/
+*.sqlite3
+chroma.sqlite3
+
+# Temporary
+*.tmp
+.cache/
+CLEANUP_SUMMARY.txt
