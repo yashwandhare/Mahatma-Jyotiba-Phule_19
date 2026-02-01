@@ -72,74 +72,66 @@ def validate_file(filepath: str) -> Tuple[bool, str]:
     return validate_file_size(filepath)
 
 
-def collect_files(path: str, recursive: bool = True) -> List[str]:
-    """
-    Collect all supported files from a path (file or directory).
-    
-    Args:
-        path: File or directory path
-        recursive: If directory, recursively collect files
-        
-    Returns:
-        List of valid file paths
-    """
-    path_obj = Path(path)
-    
-    if not path_obj.exists():
-        logger.warning(f"Path does not exist: {path}")
-        return []
-    
-    if path_obj.is_file():
-        is_valid, error = validate_file(str(path_obj))
-        if is_valid:
-            return [str(path_obj)]
-        else:
-            logger.warning(f"Skipping {path}: {error}")
-            return []
-    
-    if path_obj.is_dir():
-        files = []
-        pattern = "**/*" if recursive else "*"
-        
-        for item in path_obj.glob(pattern):
-            if item.is_file():
-                # Skip hidden files
-                if item.name.startswith('.'):
-                    continue
-                
-                is_valid, error = validate_file(str(item))
-                if is_valid:
-                    files.append(str(item))
-                else:
-                    logger.debug(f"Skipping {item}: {error}")
-        
-        return files
-    
-    return []
+def collect_valid_files(paths: List[str]) -> Tuple[List[str], List[str]]:
+    """Collect and validate files from mixed file/dir inputs.
 
+    Returns (valid_files, errors) where errors are human-readable messages.
+    No exceptions are raised for per-file issues; filesystem failures are captured as errors.
+    """
+    valid_files: List[str] = []
+    errors: List[str] = []
+    seen_files: Set[str] = set()
 
-def validate_paths(paths: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    Validate and collect files from multiple paths.
-    
-    Args:
-        paths: List of file or directory paths
-        
-    Returns:
-        (valid_files, errors) tuple
-        valid_files: List of validated file paths
-        errors: List of error messages
-    """
-    valid_files = []
-    errors = []
-    
-    for path in paths:
+    for raw_path in paths or []:
+        if not raw_path or not str(raw_path).strip():
+            continue
+
         try:
-            collected = collect_files(path)
-            valid_files.extend(collected)
-        except Exception as e:
-            errors.append(f"Error processing {path}: {e}")
-    
+            path_obj = Path(raw_path).expanduser().resolve()
+        except Exception as exc:  # Resolution issues
+            errors.append(f"{raw_path}: invalid path ({exc})")
+            continue
+
+        if not path_obj.exists():
+            errors.append(f"{path_obj}: not found")
+            continue
+
+        if path_obj.is_file():
+            canonical = str(path_obj)
+            if canonical in seen_files:
+                logger.debug("Skipping duplicate file input: %s", canonical)
+                continue
+            is_valid, error = validate_file(canonical)
+            if is_valid:
+                valid_files.append(canonical)
+                seen_files.add(canonical)
+            else:
+                errors.append(f"{path_obj}: {error}")
+            continue
+
+        if path_obj.is_dir():
+            try:
+                for item in path_obj.rglob("*"):
+                    if not item.is_file():
+                        continue
+                    if item.name.startswith('.'):
+                        continue
+                    canonical = str(item.resolve())
+                    if canonical in seen_files:
+                        logger.debug("Skipping duplicate file input: %s", canonical)
+                        continue
+                    is_valid, error = validate_file(canonical)
+                    if is_valid:
+                        valid_files.append(canonical)
+                        seen_files.add(canonical)
+                    else:
+                        errors.append(f"{item}: {error}")
+            except Exception as exc:
+                errors.append(f"{path_obj}: failed to scan directory ({exc})")
+            continue
+
+        errors.append(f"{path_obj}: unsupported path type")
+
     return valid_files, errors
 
 

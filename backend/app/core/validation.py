@@ -118,8 +118,11 @@ def get_health_status() -> dict:
     from backend.app.rag import store
     
     try:
-        collection = store.get_collection()
+        collection = store.ensure_collection_ready()
         collection_size = collection.count()
+    except store.IndexStateError:
+        logger.error("Vector store unavailable during health check")
+        collection_size = -1
     except Exception as e:
         logger.error(f"Failed to get collection size: {e}")
         collection_size = -1
