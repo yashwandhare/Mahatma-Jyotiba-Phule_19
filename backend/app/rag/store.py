@@ -1,12 +1,33 @@
 import logging
 from typing import List, Dict, Any, Optional
 import threading
+import os
 import chromadb
+
+# Suppress HuggingFace Hub warnings before importing sentence_transformers
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
+os.environ.setdefault('HF_HUB_DISABLE_EXPERIMENTAL_WARNING', '1')
+os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
+os.environ.setdefault('TRANSFORMERS_NO_ADVISORY_WARNINGS', '1')
+
 from sentence_transformers import SentenceTransformer
 from chromadb.errors import NotFoundError
 from backend.app.core import config
 
 logger = logging.getLogger(__name__)
+
+
+class IndexStateError(RuntimeError):
+    """Raised when the vector store cannot be read or written safely."""
+
+    def __init__(self, reason: str = "vector_store_unavailable"):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _raise_index_error(exc: Exception, reason: str = "vector_store_unavailable") -> "IndexStateError":
+    logger.error("Vector store unavailable (%s): %s", reason, exc, exc_info=exc)
+    raise IndexStateError(reason) from exc
 
 _client: Optional[chromadb.PersistentClient] = None
 _collection: Optional[chromadb.Collection] = None
@@ -21,7 +42,11 @@ def _get_model() -> SentenceTransformer:
     global _model
     if _model is None:
         logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
-        _model = SentenceTransformer(config.EMBEDDING_MODEL, device='cpu')
+        # Suppress warnings during model loading
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            _model = SentenceTransformer(config.EMBEDDING_MODEL, device='cpu')
     return _model
 
 def _get_db_client() -> chromadb.PersistentClient:
@@ -30,19 +55,42 @@ def _get_db_client() -> chromadb.PersistentClient:
     if _client is None:
         logger.info(f"Initializing Vector DB at: {config.DB_PATH}")
         import os
-        os.makedirs(config.DB_PATH, exist_ok=True)
-        _client = chromadb.PersistentClient(path=config.DB_PATH)
+        try:
+            os.makedirs(config.DB_PATH, exist_ok=True)
+            _client = chromadb.PersistentClient(path=config.DB_PATH)
+        except Exception as exc:
+            _raise_index_error(exc)
     return _client
 
 def get_collection() -> chromadb.Collection:
     """Return active Chroma collection, creating if needed."""
     global _collection
     client = _get_db_client()
-    
+
     if _collection is None:
-        _collection = client.get_or_create_collection(name=config.COLLECTION_NAME)
-    
+        try:
+            _collection = client.get_or_create_collection(name=config.COLLECTION_NAME)
+        except Exception as exc:
+            _raise_index_error(exc)
+
     return _collection
+
+
+def ensure_collection_ready() -> chromadb.Collection:
+    """
+    Return a collection that has been probed for basic health.
+    
+    INVARIANT: Missing/corrupted store raises explicit error (INVARIANTS.md §9).
+    Never auto-create collections during queries.
+    """
+    try:
+        collection = get_collection()
+        _ = collection.count()
+        return collection
+    except IndexStateError:
+        raise
+    except Exception as exc:
+        _raise_index_error(exc)
 
 def index_chunks(chunks: List[Dict[str, Any]]) -> None:
     """
@@ -56,7 +104,7 @@ def index_chunks(chunks: List[Dict[str, Any]]) -> None:
     logger.info(f"Preparing to index {len(chunks)} chunks...")
     
     with _lock:
-        collection = get_collection()
+        collection = ensure_collection_ready()
         model = _get_model()
 
         total_indexed = 0
@@ -107,12 +155,15 @@ def index_chunks(chunks: List[Dict[str, Any]]) -> None:
             embeddings = model.encode(documents, convert_to_tensor=False, show_progress_bar=True).tolist()
 
             logger.info(f"Upserting {len(ids)} chunks to Vector DB...")
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas
-            )
+            try:
+                collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=documents,
+                    metadatas=metadatas
+                )
+            except Exception as exc:
+                _raise_index_error(exc)
             
             total_indexed += len(ids)
         
@@ -130,3 +181,5 @@ def clear_index():
             logger.info("Index cleared.")
         except NotFoundError:
             logger.info("No existing collection to clear.")
+        except Exception as exc:
+            _raise_index_error(exc)
