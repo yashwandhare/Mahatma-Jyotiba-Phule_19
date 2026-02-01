@@ -1,82 +1,163 @@
 # RAGex
 
-**Context-Aware Document QA with Dynamic RAG**
-
-RAGex answers questions strictly from your local documents—or refuses when information is missing.
+Local-first question answering for your documents.
 
 ---
 
-## What It Does
+## What is RAGex?
 
-- Indexes local folders (PDFs, text files, code)
-- Retrieves relevant chunks dynamically (not fixed top-K)
-- Generates grounded answers with source citations
-- Refuses explicitly when documents lack the answer
+RAGex is a command-line tool that answers questions using only the documents you provide. It indexes files locally, retrieves relevant passages, and generates responses grounded in those passages. When the answer is not in your documents, it refuses instead of guessing.
+
+All processing happens on your machine. No data leaves your system unless you explicitly configure a remote language model.
 
 ---
 
-## Quick Start
+## Why RAGex Exists
 
-### 1. Setup
+Language models hallucinate. They produce confident answers that sound correct but are not. For personal knowledge bases, technical documentation, or any scenario where correctness matters more than convenience, hallucination is unacceptable.
+
+RAGex guarantees that every answer is grounded in a specific document you provided, or it returns no answer at all. This tool exists because guessing is worse than silence.
+
+---
+
+## Key Guarantees
+
+- Answers are grounded in indexed documents or explicitly refused
+- Source citations are provided for every response
+- No network access in offline mode
+- No data uploaded without explicit remote provider configuration
+- No behavior changes without user action
+- No hidden model calls or background indexing
+
+---
+
+## Installation
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
+bash install.sh
 ```
 
-### 2. Configure
-Create `.env` file:
-```
-GROQ_API_KEY=your_key_here
-```
+The installer is interactive. It will:
 
-### 3. Test Pipeline
+- Create a Python virtual environment
+- Install required dependencies
+- Generate a configuration file
+- Prompt for necessary settings
+
+No manual file editing is required.
+
+---
+
+## Basic Usage
+
+**Index and query documents:**
+
 ```bash
-python test_pipeline.py
+ragex docs/
 ```
 
-Expected output:
-- Valid query → Answer + citations
-- Invalid query → `"Answer: Not found in indexed documents."`
+This opens an interactive session. Type questions and receive grounded answers.
+
+**Ask a single question:**
+
+```bash
+ragex docs/ --ask "What is the main argument?"
+```
+
+**Clear the index and rebuild:**
+
+```bash
+ragex clean
+ragex docs/
+```
+
+**Edit configuration:**
+
+```bash
+ragex config
+```
+
+This opens your configuration file for editing provider, model, or storage settings.
 
 ---
 
-## Project Structure
+## How It Works
 
-```
-backend/app/rag/    # Core RAG pipeline
-  ├── loader.py     # File parsing
-  ├── chunker.py    # Text chunking
-  ├── store.py      # Vector storage
-  ├── retriever.py  # Dynamic retrieval
-  └── generator.py  # Answer generation
+RAGex follows a three-step process:
 
-docs/               # Documentation + demo files
-test_pipeline.py    # End-to-end test
-```
+1. **Index** – Documents are parsed, split into overlapping chunks, and stored locally with vector embeddings.
+2. **Retrieve** – For each question, the most relevant chunks are identified using semantic similarity.
+3. **Answer or Refuse** – A language model generates a response using only the retrieved chunks. If the chunks do not contain sufficient information, the system refuses to answer.
+
+The same behavior applies whether you use the CLI, API, or file browser integration.
 
 ---
 
-## Key Features
+## Privacy & Offline Mode
 
-**Dynamic Retrieval**
-- Similarity threshold: 0.40
-- Drop-off detection: 0.10
-- Variable context size per query
+**What stays local:**
 
-**Source Citations**
-- PDFs: filename + page number
-- Text/Code: filename + line range
+- All indexed documents
+- Vector embeddings
+- Retrieved passages
+- Generated answers (when using a local model)
 
-**Mandatory Refusal**
-- No hallucination
-- No speculation
-- Exact format enforced
+**When network is used:**
+
+- Only if you configure a remote language model provider (e.g., Groq)
+- Only during answer generation
+- Only the retrieved passages and your question are sent, not the entire document set
+
+**Offline mode guarantees:**
+
+```bash
+ragex docs/ --offline
+```
+
+When offline mode is enabled:
+
+- No network requests are permitted
+- Local model (Ollama) must be configured and running
+- System will refuse to operate if a remote provider is configured
 
 ---
 
-## Philosophy
+## OS Integration
 
-*"A system that refuses correctly is smarter than one that answers confidently."*
+RAGex includes optional desktop integration for Linux and macOS. Once installed, you can right-click any file or folder and select "Index with RAGex" from the context menu.
 
-See [docs/RPD.md](docs/RPD.md) for complete requirements and architecture.
+This opens a terminal, runs the same CLI tool, and provides the same guarantees as manual invocation. No separate service or background process is required.
+
+---
+
+## Who This Is For
+
+**RAGex is for:**
+
+- Researchers managing personal document collections
+- Developers querying internal documentation
+- Anyone who needs verifiable answers from a specific corpus
+- Users who value correctness over convenience
+
+**RAGex is not for:**
+
+- General-purpose chat assistance
+- Real-time web search integration
+- Large-scale multi-user deployments
+- Users who expect answers to questions outside their document set
+
+---
+
+## Project Status
+
+RAGex is stable and actively usable. The scope is frozen. No additional features are planned unless a bug is discovered or a clear deficiency in the existing scope is identified.
+
+The CLI and API are maintained. The browser frontend is provided for demonstration purposes but is not actively developed.
+
+---
+
+## Further Documentation
+
+- [QUICK_START.md](docs/QUICK_START.md) – Detailed usage examples with screenshots
+- [INVARIANTS.md](docs/INVARIANTS.md) – System guarantees and behavioral contracts
+- [RPD.md](docs/RPD.md) – Requirements, design decisions, and architecture.
