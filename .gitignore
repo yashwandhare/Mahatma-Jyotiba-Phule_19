@@ -33,3 +33,13 @@ chroma.sqlite3
 *.tmp
 .cache/
 CLEANUP_SUMMARY.txt
+# Documentation Reports
+BACKEND_REFINEMENT.md
+report.md
+docs/RPD_followon.md
+
+# Backup files
+frontend/index.html.backup
+
+# Test data
+backend/data/
