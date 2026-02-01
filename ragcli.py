@@ -6,10 +6,26 @@ import logging
 import os
 import sys
 import time
-from typing import List
+from typing import List, Tuple
 from pathlib import Path
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from io import StringIO
+
+from cli.ui import (
+    configure_console, 
+    render_answer, 
+    print_logo, 
+    print_phase, 
+    print_success, 
+    print_warning, 
+    print_error, 
+    print_info,
+    create_spinner,
+    render_indexing_summary,
+    render_config_table,
+    get_console
+)
+from backend.app.core.errors import get_error_message
 
 
 class Colors:
@@ -27,35 +43,33 @@ class Colors:
         cls.PINK = cls.GREEN = cls.YELLOW = cls.BLUE = cls.GRAY = cls.BOLD = cls.DIM = cls.RESET = ""
 
 
+
+def print_vector_store_unavailable():
+    """Display a friendly message when the vector store cannot be accessed."""
+    print_error(get_error_message('vector_store_unavailable'))
+    print_info("Run 'ragex clean' to rebuild the index and try again.")
+    print()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ragex",
-        description="RAGex – Context-aware document QA",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  ragex documents/                         # Index a folder and start REPL
-  ragex file.pdf --ask "What is this about?"  # Index and ask question
-  ragex docs/ --summary                    # Generate document summary
-  ragex docs/ --describe                   # Describe document contents
-  ragex --clear-index docs/                # Rebuild index from scratch
-  ragex --offline --provider ollama        # Use local Ollama
-        """
+        description="Index documents and ask grounded questions with one command.",
     )
 
     parser.add_argument(
         "paths",
         nargs="*",
-        help="Folder(s) or file(s) to index (optional for REPL-only mode)",
+        help="File and folder paths to index before answering",
     )
-    parser.add_argument("--ask", help="Ask a single question after indexing", type=str, metavar="QUESTION")
-    parser.add_argument("--summary", help="Generate a summary of indexed documents", action="store_true")
-    parser.add_argument("--describe", help="Describe what the indexed documents are about", action="store_true")
-    parser.add_argument("--clear-index", help="Clear the vector DB before indexing", action="store_true")
-    parser.add_argument("--provider", help="LLM provider (default: groq)", choices=["groq", "ollama"], default="groq")
-    parser.add_argument("--model", help="LLM model name (provider-specific)", type=str, metavar="NAME")
-    parser.add_argument("--offline", help="Disable remote providers (Groq)", action="store_true")
-    parser.add_argument("--verbose", help="Enable debug logging", action="store_true")
+    parser.add_argument("--ask", help="Index (if needed) and answer one question", type=str, metavar="QUESTION")
+    parser.add_argument("--summary", help="Summarize the indexed documents", action="store_true")
+    parser.add_argument("--describe", help="Describe what the indexed documents cover", action="store_true")
+    parser.add_argument("--clear-index", help="Clear the index before processing new files", action="store_true")
+    parser.add_argument("--provider", help="LLM provider to use", choices=["groq", "ollama"], default="groq")
+    parser.add_argument("--model", help="LLM model name for the chosen provider", type=str, metavar="NAME")
+    parser.add_argument("--offline", help="Force offline mode (Ollama only)", action="store_true")
+    parser.add_argument("--verbose", help="Show debug logs", action="store_true")
     parser.add_argument("--no-color", help="Disable colored output", action="store_true")
     parser.add_argument("--version", action="version", version="RAGex 1.0.0")
 
@@ -94,6 +108,10 @@ def configure_logging(verbose: bool):
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
+    warnings.filterwarnings(
+        "ignore",
+        message="You are sending unauthenticated requests to the HF Hub.*",
+    )
 
 
 @contextmanager
@@ -126,171 +144,159 @@ def apply_env(args: argparse.Namespace):
 
 def load_backend():
     """Lazy-load backend modules to avoid import-time logs."""
-    from backend.app.rag import loader, chunker, store, retriever, generator
-    from backend.app.core import config
+    from backend.app.rag import retriever, generator, indexer, store
 
-    return loader, chunker, store, retriever, generator, config
-
-
-def banner():
-    """Display ASCII art banner."""
-    art = f"""{Colors.PINK}
-██████╗  █████╗  ██████╗ ███████╗██╗  ██╗
-██╔══██╗██╔══██╗██╔════╝ ██╔════╝╚██╗██╔╝
-██████╔╝███████║██║  ███╗█████╗   ╚███╔╝ 
-██╔══██╗██╔══██║██║   ██║██╔══╝   ██╔██╗ 
-██║  ██║██║  ██║╚██████╔╝███████╗██╔╝ ██╗
-╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝{Colors.RESET}
-"""
-    print(art)
-    print(f"{Colors.DIM}Context-Aware Document QA • v1.0.0{Colors.RESET}\n")
+    return retriever, generator, indexer, store
 
 
-def get_interactive_paths() -> List[str]:
-    """Interactively prompt user for file/folder paths."""
-    print(f"{Colors.BOLD}📁 Document Selection{Colors.RESET}")
-    print(f"{Colors.DIM}Enter paths to index (one per line, press Enter twice when done){Colors.RESET}\n")
-    
-    paths = []
+
+def get_interactive_paths() -> Tuple[List[str], bool]:
+    """Interactively prompt for file/folder paths.
+
+    Returns the collected paths and whether the user chose to reuse the existing index.
+    """
+    console = get_console()
+    console.print("Document Selection", style="bold cyan")
+    print_info("Enter a path per line. Press Enter immediately to reuse the existing index.")
+    console.print()
+
+    paths: List[str] = []
     try:
         while True:
-            prompt = f"{Colors.BLUE}❯{Colors.RESET} " if paths else f"{Colors.BLUE}❯{Colors.RESET} "
+            prompt = f"{Colors.BLUE}❯{Colors.RESET} " if not paths else f"{Colors.DIM}❯{Colors.RESET} "
             line = input(prompt).strip()
-            
+
             if not line:
-                if paths:
-                    break
-                else:
-                    print(f"{Colors.YELLOW}⚠ Please provide at least one path{Colors.RESET}")
-                    continue
-            
-            # Expand home directory and resolve path
-            expanded = Path(line).expanduser().resolve()
-            
-            if expanded.exists():
-                paths.append(str(expanded))
-                print(f"{Colors.DIM}  ✓ Added{Colors.RESET}")
-            else:
-                print(f"{Colors.YELLOW}  ✗ Not found: {line}{Colors.RESET}")
-                retry = input(f"{Colors.DIM}  Try again? (y/n): {Colors.RESET}").lower()
-                if retry != 'y':
-                    continue
-                    
+                if not paths:
+                    print_info("Using existing index without changes")
+                    console.print()
+                    return [], True
+                break
+
+            paths.append(line)
+            print(f"{Colors.DIM}  ✔ Added{Colors.RESET}")
+
     except KeyboardInterrupt:
-        print(f"\n{Colors.DIM}Cancelled{Colors.RESET}")
+        print_info("\nCancelled")
         sys.exit(0)
-    
-    print()
-    return paths
+
+    console.print()
+    return paths, False
 
 
-def validate_paths(paths: List[str]) -> List[str]:
-    """Validate and normalize paths."""
-    valid = []
-    invalid = []
-    
-    for p in paths:
-        if not p or not str(p).strip():
-            continue
-        
-        # Expand and resolve path
-        expanded = Path(p).expanduser().resolve()
-        
-        if not expanded.exists():
-            invalid.append(p)
-            continue
-        
-        valid.append(str(expanded))
-    
-    # Report invalid paths
-    if invalid:
-        print(f"{Colors.YELLOW}⚠ Skipped {len(invalid)} invalid path(s){Colors.RESET}")
-        for p in invalid:
-            print(f"{Colors.DIM}  • {p}{Colors.RESET}")
-        print()
-    
-    if not valid:
-        print(f"{Colors.YELLOW}✗ No valid paths provided{Colors.RESET}")
+def run_config_command(argv: List[str] | None = None):
+    """Handle the `ragex config` command - show effective configuration."""
+    config_parser = argparse.ArgumentParser(
+        prog="ragex config",
+        description="Display effective RAGex configuration",
+    )
+    config_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    config_parser.add_argument("--show-secrets", action="store_true", help="Show full API keys (use carefully)")
+
+    args = config_parser.parse_args(argv)
+
+    configure_console(args.no_color)
+    if args.no_color:
+        Colors.disable()
+
+    # Import config after environment is set
+    from backend.app.core.config import get_config_dict
+
+    console = get_console()
+    console.print("\nRAGex Configuration", style="bold cyan")
+    print_info("Effective values (defaults → .env → environment)")
+    console.print()
+
+    config_dict = get_config_dict(mask_secrets=not args.show_secrets)
+    render_config_table(config_dict, show_secrets=args.show_secrets)
+    console.print()
+
+
+def run_clean_command(argv: List[str] | None = None):
+    """Handle the `ragex clean` command."""
+    clean_parser = argparse.ArgumentParser(
+        prog="ragex clean",
+        description="Safely clear the RAGex vector index",
+    )
+    clean_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    clean_parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+
+    args = clean_parser.parse_args(argv)
+
+    configure_console(args.no_color)
+    if args.no_color:
+        Colors.disable()
+
+    configure_logging(args.verbose)
+
+    console = get_console()
+    console.print()
+    print_phase("RAGex Index Cleaner", icon="🧹")
+    console.print()
+
+    try:
+        from backend.app.rag import indexer, store as store_mod
+        removed = indexer.clean_index()
+        if removed:
+            print_success(f"Cleared index ({removed} chunk(s) removed)")
+        else:
+            print_info("Index was already empty")
+    except store_mod.IndexStateError:
+        print_vector_store_unavailable()
         sys.exit(1)
-    
-    return valid
+    except Exception as exc:
+        logging.exception("Failed to clear index", exc_info=exc)
+        if args.verbose:
+            raise
+        print_error(get_error_message('index_clean_failed'))
+        sys.exit(1)
+    console.print()
+    sys.exit(0)
 
 
-def run_indexing(loader, chunker_mod, store, paths: List[str], clear_index: bool):
+def run_indexing(indexer_mod, paths: List[str], clear_index: bool):
     """Index documents into vector store."""
-    collection = store.get_collection()
-    existing = collection.count()
-
-    # Handle index clearing
-    if clear_index and existing:
-        print(f"{Colors.BLUE}🗑  Clearing index ({existing} chunks)...{Colors.RESET}", end=" ", flush=True)
-        store.clear_index()
-        print(f"{Colors.GREEN}✓{Colors.RESET}")
-        existing = 0
-
-    # Skip if already indexed
-    if existing and not clear_index:
-        print(f"{Colors.GREEN}✓ Index ready ({existing} chunks){Colors.RESET}")
-        print(f"{Colors.DIM}  Use --clear-index to rebuild{Colors.RESET}\n")
-        return
+    console = get_console()
 
     # Show what we're indexing
-    print(f"{Colors.BOLD}📚 Indexing {len(paths)} path(s){Colors.RESET}")
+    console.print("Indexing", style="bold cyan")
     for p in paths:
         name = Path(p).name
-        print(f"{Colors.DIM}  • {name}{Colors.RESET}")
-    print()
+        print_info(f"  • {name}")
+    console.print()
     
     start = time.time()
 
-    # Load documents
-    print(f"{Colors.BLUE}⏳ Loading documents...{Colors.RESET}", end=" ", flush=True)
-    docs = loader.load_inputs(paths)
-    
-    if not docs:
-        print(f"\n{Colors.YELLOW}✗ No documents found{Colors.RESET}")
-        print(f"{Colors.DIM}  Supported: PDF, TXT, MD, code files{Colors.RESET}")
-        sys.exit(1)
-    
-    print(f"{Colors.GREEN}✓ {len(docs)}{Colors.RESET}")
+    # Run canonical indexing pipeline with spinner
+    with create_spinner("Loading documents..."):
+        result = indexer_mod.index_paths(paths, clear_index=clear_index)
 
-    # Chunk documents
-    print(f"{Colors.BLUE}⏳ Creating chunks...{Colors.RESET}", end=" ", flush=True)
-    chunker_inst = chunker_mod.Chunker()
-    chunks = chunker_inst.chunk(docs)
-    print(f"{Colors.GREEN}✓ {len(chunks)}{Colors.RESET}")
-
-    # Store in vector DB
-    print(f"{Colors.BLUE}⏳ Building index...{Colors.RESET}", end=" ", flush=True)
-    store.index_chunks(chunks)
     elapsed = time.time() - start
-    print(f"{Colors.GREEN}✓ {elapsed:.1f}s{Colors.RESET}\n")
+
+    # Show any warnings
+    if result.index_cleared:
+        print_info(f"Cleared existing index (removed {result.chunks_removed} chunk(s))")
+
+    if result.files_skipped:
+        print_warning(f"Skipped {result.files_skipped} file(s) (unsupported format)")
+
+    if result.documents_indexed == 0:
+        print_error(get_error_message('no_valid_documents'))
+        print_info("  Supported: PDF, TXT, MD, code files")
+        sys.exit(1)
+
+    # Show summary
+    render_indexing_summary(result)
+    print_info(f"Completed in {elapsed:.1f}s")
+    console.print()
+    return result
 
 
-def render_answer(answer: str, sources: List[str]):
-    """Render answer with sources in a clean format."""
-    is_refusal = "Not found in indexed documents" in answer
-    
-    print(f"\n{Colors.BOLD}Answer{Colors.RESET}")
-    print("─" * 50)
-    
-    if is_refusal:
-        print(f"{Colors.DIM}{answer}{Colors.RESET}")
-    else:
-        print(answer)
-    
-    if sources:
-        print(f"\n{Colors.BOLD}Sources{Colors.RESET}")
-        print("─" * 50)
-        for i, src in enumerate(sources, 1):
-            # Truncate long paths
-            display = src if len(src) < 60 else "..." + src[-57:]
-            print(f"{Colors.DIM}{i}.{Colors.RESET} {display}")
 
-
-def run_query(retriever, generator, question: str, verbose: bool = False, intent=None):
+def run_query(retriever, generator, store_mod, question: str, verbose: bool = False, intent=None):
     """Execute a single query with intent support."""
     from backend.app.rag.intent import detect_intent, get_retrieval_strategy, QueryIntent
+    console = get_console()
     
     if not question or not question.strip():
         return
@@ -303,50 +309,53 @@ def run_query(retriever, generator, question: str, verbose: bool = False, intent
     
     intent_label = query_intent.value if hasattr(query_intent, 'value') else str(query_intent)
     
-    # Show minimal progress indicator
-    print(f"{Colors.DIM}Thinking ({intent_label})...{Colors.RESET}", end="\r", flush=True)
+    # Show progress with spinner
     start = time.time()
-
+    
     # Get retrieval strategy
     strategy = get_retrieval_strategy(query_intent)
     
-    # Retrieve and generate - suppress HF model loading output
-    with suppress_output(verbose):
-        retrieval_res = retriever.retrieve(
-            question,
-            top_k=strategy["top_k"],
-            min_similarity=strategy["min_similarity"],
-            diverse_sampling=strategy["diverse_sampling"]
-        )
-        chunks = retrieval_res.get("chunks", [])
-        gen_res = generator.generate_answer(
-            question,
-            chunks,
-            intent=query_intent,
-            strict_refusal=strategy["strict_refusal"]
-        )
+    try:
+        # Retrieve and generate - suppress HF model loading output
+        with suppress_output(verbose), create_spinner(f"Processing ({intent_label})..."):
+            retrieval_res = retriever.retrieve(
+                question,
+                top_k=strategy["top_k"],
+                min_similarity=strategy["min_similarity"],
+                diverse_sampling=strategy["diverse_sampling"]
+            )
+            chunks = retrieval_res.get("chunks", [])
+            gen_res = generator.generate_answer(
+                question,
+                chunks,
+                intent=query_intent,
+                strict_refusal=strategy["strict_refusal"]
+            )
+    except store_mod.IndexStateError:
+        print_vector_store_unavailable()
+        return
 
-    # Clear progress line
-    print(" " * 40, end="\r")
-
-    # Render results with intent badge
-    badge_color = Colors.BLUE if intent_label != "factual" else Colors.GREEN
-    print(f"{badge_color}[{intent_label}]{Colors.RESET}\n")
+    # Render results
+    console.print()
     render_answer(gen_res.get("answer", ""), gen_res.get("sources", []))
     
     elapsed = time.time() - start
-    print(f"\n{Colors.DIM}Completed in {elapsed:.1f}s{Colors.RESET}\n")
+    console.print()
+    print_info(f"Completed in {elapsed:.1f}s • intent: {intent_label}")
+    console.print()
 
 
-def repl_loop(retriever, generator, verbose: bool = False):
+def repl_loop(retriever, generator, store_mod, verbose: bool = False):
     """Interactive REPL for questions."""
-    print(f"{Colors.GREEN}✓ Ready{Colors.RESET}")
-    print(f"{Colors.DIM}Type your question (or 'exit' to quit){Colors.RESET}\n")
+    console = get_console()
+    print_success("Ready")
+    print_info("Type your question (or 'exit' to quit)")
+    console.print()
     
     try:
         while True:
             try:
-                q = input(f"{Colors.PINK}❯{Colors.RESET} ").strip()
+                q = input(f"{Colors.BLUE}❯{Colors.RESET} ").strip()
             except EOFError:
                 break
                 
@@ -355,16 +364,34 @@ def repl_loop(retriever, generator, verbose: bool = False):
             if not q:
                 continue
                 
-            run_query(retriever, generator, q, verbose)
+            run_query(retriever, generator, store_mod, q, verbose)
             
     except KeyboardInterrupt:
-        print(f"\n{Colors.DIM}Goodbye{Colors.RESET}")
+        console.print()
+        print_info("Goodbye")
+        console.print()
 
 
 def main(argv: List[str] | None = None):
     """Main CLI entry point."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    store_mod = None
+
+    # Handle subcommands
+    if argv and argv[0] == "clean":
+        run_clean_command(argv[1:])
+        return
+    
+    if argv and argv[0] == "config":
+        run_config_command(argv[1:])
+        return
+
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    configure_console(args.no_color)
 
     # Configure colors and logging FIRST (before any imports)
     if args.no_color:
@@ -381,65 +408,85 @@ def main(argv: List[str] | None = None):
     
     configure_logging(args.verbose)
     apply_env(args)
-
-    # Show banner unless in single-question mode
+    
+    # Show logo for interactive sessions
     if not args.ask:
-        banner()
-        provider_display = f"{args.provider}"
-        if args.model:
-            provider_display += f" ({args.model})"
-        print(f"{Colors.DIM}Provider: {provider_display}{Colors.RESET}")
-        if args.offline:
-            print(f"{Colors.DIM}Mode: Offline{Colors.RESET}")
-        print()
+        print_logo(args.provider, args.model, args.offline)
 
     # Load backend modules (suppress import logs)
+    console = get_console()
     try:
-        if not args.ask and not args.verbose:
-            print(f"{Colors.DIM}Initializing...{Colors.RESET}", end="\r", flush=True)
-        
-        loader, chunker_mod, store, retriever, generator, config = load_backend()
-        
-        if not args.ask and not args.verbose:
-            print(" " * 40, end="\r")  # Clear "Initializing..."
+        if not args.verbose:
+            with create_spinner("Initializing..."):
+                retriever, generator, indexer_mod, store_mod = load_backend()
+        else:
+            retriever, generator, indexer_mod, store_mod = load_backend()
             
     except Exception as exc:
-        print(f"{Colors.YELLOW}✗ Failed to load backend: {exc}{Colors.RESET}")
+        logging.exception("Failed to load backend", exc_info=exc)
         if args.verbose:
             raise
+        print_error(get_error_message('backend_init_failed'))
         sys.exit(1)
 
     # Determine paths to index
-    paths_to_index = args.paths
-    
-    if not paths_to_index and not args.ask:
-        # Interactive mode: ask user for paths
-        paths_to_index = get_interactive_paths()
-    
+    paths_to_index: List[str] = list(args.paths)
+    reused_existing = False
+    interactive_mode = not (args.ask or args.summary or args.describe)
+
+    if not paths_to_index and interactive_mode:
+        paths_to_index, reused_existing = get_interactive_paths()
+
+    indexing_result = None
+
     # Index documents if paths provided
     if paths_to_index:
-        valid_paths = validate_paths(paths_to_index)
-        run_indexing(loader, chunker_mod, store, valid_paths, args.clear_index)
+        try:
+            indexing_result = run_indexing(indexer_mod, paths_to_index, args.clear_index)
+        except store_mod.IndexStateError:
+            print_vector_store_unavailable()
+            sys.exit(1)
+        except Exception as exc:
+            logging.exception("Indexing failed", exc_info=exc)
+            if args.verbose:
+                raise
+            print_error(get_error_message('indexing_failed'))
+            sys.exit(1)
     else:
         # No paths provided
         if args.ask:
-            print(f"{Colors.YELLOW}⚠ No paths provided, querying existing index{Colors.RESET}\n")
+            print_info("Answering question using the existing index")
+            console.print()
+        elif args.summary:
+            print_info("Summarizing the existing index")
+            console.print()
+        elif args.describe:
+            print_info("Describing the existing index")
+            console.print()
+        elif not reused_existing:
+            print_info("Using existing index without changes")
+            console.print()
+
+    if interactive_mode:
+        if indexing_result:
+            print_info("Entering Q&A mode with freshly indexed documents")
         else:
-            print(f"{Colors.YELLOW}⚠ No paths provided, using existing index{Colors.RESET}\n")
+            print_info("Entering Q&A mode with existing index")
+        console.print()
 
     # Execute query or start REPL
     if args.ask:
-        run_query(retriever, generator, args.ask, args.verbose)
+        run_query(retriever, generator, store_mod, args.ask, args.verbose)
     elif args.summary:
         from backend.app.rag.intent import QueryIntent
         summary_query = "Summarize the main points and key information from these documents."
-        run_query(retriever, generator, summary_query, args.verbose, intent=QueryIntent.SUMMARY)
+        run_query(retriever, generator, store_mod, summary_query, args.verbose, intent=QueryIntent.SUMMARY)
     elif args.describe:
         from backend.app.rag.intent import QueryIntent
         describe_query = "What are these documents about? Describe their main topics and purpose."
-        run_query(retriever, generator, describe_query, args.verbose, intent=QueryIntent.DESCRIPTION)
+        run_query(retriever, generator, store_mod, describe_query, args.verbose, intent=QueryIntent.DESCRIPTION)
     else:
-        repl_loop(retriever, generator, args.verbose)
+        repl_loop(retriever, generator, store_mod, args.verbose)
 
 
 if __name__ == "__main__":  # pragma: no cover
