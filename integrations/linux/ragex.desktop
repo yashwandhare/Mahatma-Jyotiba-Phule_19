@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=RAGex
+Comment=Open files and folders with RAGex
+Exec=__INSTALL_DIR__/integrations/linux/ragex-launcher.sh %F
+Terminal=true
+Categories=Utility;
+StartupNotify=false
+Path=__INSTALL_DIR__

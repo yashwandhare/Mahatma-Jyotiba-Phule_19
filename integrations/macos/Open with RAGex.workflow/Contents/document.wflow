@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>AMApplicationBuild</key>
+    <string>614</string>
+    <key>AMApplicationVersion</key>
+    <string>2.10</string>
+    <key>AMDocumentVersion</key>
+    <string>2</string>
+    <key>actions</key>
+    <array>
+        <dict>
+            <key>AMActionVersion</key>
+            <string>2.7.0</string>
+            <key>AMActionUUID</key>
+            <string>7D803C65-83E9-4F55-82A8-A6FBB3C3C671</string>
+            <key>AMParameters</key>
+            <dict>
+                <key>COMMAND_STRING</key>
+                <string><![CDATA[CLI="__CLI_SHIM_PATH__"
+if [[ ! -x "$CLI" ]]; then
+    CLI="$(command -v ragex 2>/dev/null || true)"
+fi
+if [[ -z "$CLI" ]]; then
+    /usr/bin/osascript -e 'display dialog "Could not find ragex" buttons {"OK"} default button 1 with icon caution'
+    exit 1
+fi
+
+# Build a script that properly handles arguments with spaces
+TEMP_SCRIPT=$(mktemp)
+{
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo ''
+    printf 'CLI=%q\n' "$CLI"
+    echo 'ARGS=('
+    for ITEM in "$@"; do
+        printf '  %q\n' "$ITEM"
+    done
+    echo ')'
+    echo ''
+    echo '"$CLI" "${ARGS[@]}"'
+    echo 'echo ""'
+    echo 'echo "Press Enter to close..."'
+    echo 'read'
+} > "$TEMP_SCRIPT"
+chmod +x "$TEMP_SCRIPT"
+
+# Launch Terminal with the script
+/usr/bin/osascript - "$TEMP_SCRIPT" <<'APPLESCRIPT'
+on run argv
+    set scriptPath to item 1 of argv
+    tell application "Terminal"
+        activate
+        do script "bash " & quoted form of scriptPath & "; rm -f " & quoted form of scriptPath
+    end tell
+end run
+APPLESCRIPT
+]]></string>
+                <key>PassInput</key>
+                <string>as arguments</string>
+                <key>Shell</key>
+                <string>/bin/bash</string>
+            </dict>
+            <key>AMWorkflowActionVersion</key>
+            <string>2.7.0</string>
+            <key>bundleIdentifier</key>
+            <string>com.apple.Automator.RunShellScript</string>
+            <key>className</key>
+            <string>AMShellScriptAction</string>
+            <key>isViewVisible</key>
+            <true/>
+            <key>name</key>
+            <string>Run Shell Script</string>
+        </dict>
+    </array>
+    <key>workflowMetaData</key>
+    <dict>
+        <key>AMWorkflowTypeIdentifier</key>
+        <string>com.apple.Automator.servicesMenu</string>
+        <key>NSPersistentUIExecutionState</key>
+        <string>1</string>
+        <key>serviceInputTypeIdentifier</key>
+        <string>com.apple.Automator.fileSystemObject</string>
+        <key>serviceOutputTypeIdentifier</key>
+        <string>com.apple.Automator.nothing</string>
+        <key>serviceProcessesInput</key>
+        <true/>
+        <key>workflowType</key>
+        <integer>0</integer>
+    </dict>
+</dict>
+</plist>
